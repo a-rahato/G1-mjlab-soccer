@@ -1,7 +1,14 @@
 *.egg-info
+.DS_Store
+.venv
+.uv-cache
+.uv-python
+.cache
+.matplotlib
 .idea
 outputs
 logs
+videos
 wandb
 MUJOCO_LOG.TXT
 deploy/robots/go2/build
