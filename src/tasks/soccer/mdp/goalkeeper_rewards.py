@@ -52,7 +52,7 @@ def _reset_gk_state(
   """Reset per-environment GK tracking state on episode start."""
   if env_ids is None:
     env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int)
-  for key in ("_gk_max_ball_speed", "_gk_block_awarded", "_gk_conceded"):
+  for key in ("_gk_max_ball_speed", "_gk_block_awarded", "_gk_conceded", "_gk_clear_awarded"):
     t = getattr(env, key, None)
     if t is not None and t.shape[0] == env.num_envs:
       t[env_ids] = 0.0
@@ -240,6 +240,85 @@ def goalkeeper_stop_ball(
     setattr(env, "_gk_block_awarded", block_awarded)
 
   return reward
+
+
+def goalkeeper_clear_ball(
+  env: ManagerBasedRlEnv,
+  min_clear_vx: float = 0.5,
+  near_goal_x: float = 0.25,
+  goal_x: float = -0.5,
+  goal_half_width: float = 1.5,
+  goal_height: float = 1.8,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+) -> torch.Tensor:
+  """One-shot reward for clearing the ball away from the goal.
+
+  A normal block can merely slow the ball near the keeper. For harder shots we
+  also want an active deflection: after contact, the ball should move back
+  toward +x or leave the goal frame before it crosses the goal plane. This term
+  rewards that safe clearance once per episode.
+  """
+  ball: Entity = env.scene[ball_cfg.name]
+  ball_pos = ball.data.root_link_pos_w
+  ball_vel = ball.data.root_link_lin_vel_w
+  ball_x_rel = ball_pos[:, 0] - env.scene.env_origins[:, 0]
+  ball_y_rel = ball_pos[:, 1] - env.scene.env_origins[:, 1]
+
+  in_front_of_goal = ball_x_rel > goal_x
+  near_keeper_or_goal = ball_x_rel < near_goal_x
+  moving_out = ball_vel[:, 0] > min_clear_vx
+  out_of_frame = (ball_y_rel.abs() > goal_half_width) | (ball_pos[:, 2] > goal_height)
+  clear_detected = in_front_of_goal & near_keeper_or_goal & (moving_out | out_of_frame)
+
+  clear_awarded = _gk_get_or_init_state(env, "_gk_clear_awarded", 0.0)
+  fire = clear_detected & (clear_awarded < 0.5)
+
+  reward = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+  if torch.any(fire):
+    ids = torch.nonzero(fire, as_tuple=False).squeeze(-1)
+    reward[ids] = 1.0
+    clear_awarded[ids] = 1.0
+    setattr(env, "_gk_clear_awarded", clear_awarded)
+  return reward
+
+
+def goalkeeper_strike_through(
+  env: ManagerBasedRlEnv,
+  contact_std: float = 0.16,
+  min_limb_vx: float = 0.2,
+  near_x: float = 0.35,
+  ball_cfg: SceneEntityCfg = SceneEntityCfg("ball"),
+  robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+  ee_body_names: tuple[str, ...] = (
+    "left_wrist_yaw_link",
+    "right_wrist_yaw_link",
+    "left_ankle_roll_link",
+    "right_ankle_roll_link",
+  ),
+) -> torch.Tensor:
+  """Dense reward for forceful limb motion through the ball toward +x.
+
+  The ball travels from +x to -x. A stronger save should put a hand/foot near the
+  ball and move that limb back toward +x, so the contact does not only absorb
+  energy but actively clears the ball out. The distance gate keeps this from
+  rewarding unrelated arm swinging far from the ball.
+  """
+  ball: Entity = env.scene[ball_cfg.name]
+  robot: Entity = env.scene[robot_cfg.name]
+
+  ball_pos = ball.data.root_link_pos_w
+  ball_x_rel = ball_pos[:, 0] - env.scene.env_origins[:, 0]
+  ee_indices = _resolve_ee_indices(robot, ee_body_names)
+  ee_pos = robot.data.body_link_pos_w[:, ee_indices]
+  ee_vel = robot.data.body_link_lin_vel_w[:, ee_indices]
+
+  dist_sq = torch.sum((ee_pos - ball_pos.unsqueeze(1)) ** 2, dim=-1)
+  proximity = torch.exp(-dist_sq / (contact_std * contact_std))
+  outward_vx = torch.clamp(ee_vel[:, :, 0] - min_limb_vx, min=0.0)
+  per_limb = proximity * outward_vx
+
+  near_plane = (ball_x_rel.abs() < near_x).to(per_limb.dtype)
+  return torch.max(per_limb, dim=1).values * near_plane
 
 
 def goalkeeper_goal_conceded(

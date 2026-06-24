@@ -27,14 +27,15 @@ from src.tasks.soccer import mdp
 from src.tasks.soccer.config.g1.gk_train_cfg import goalkeeper_train_runner_cfg
 from src.tasks.soccer.mdp.goalkeeper_rewards import (
   _reset_gk_state, goalkeeper_goal_conceded, goalkeeper_intercept_point,
-  goalkeeper_body_intercept, goalkeeper_stop_ball, goalkeeper_posture_orientation)
+  goalkeeper_body_intercept, goalkeeper_clear_ball, goalkeeper_stop_ball,
+  goalkeeper_posture_orientation, goalkeeper_strike_through)
 from src.tasks.soccer.mdp.shooter_rewards import action_rate_l2_clip
 
 
 @dataclass
 class Cfg:
   init: str = "logs/repairs/base_r2.pt"      # actor init (the diving student)
-  bc_data: str = "logs/repairs/fix_r2.pt"    # BC anchor dataset
+  bc_data: str = "logs/repairs/fix_r2.pt"    # BC anchor dataset; empty disables anchor
   out: str = "logs/repairs/polished.pt"
   num_envs: int = 1024
   warmup: int = 50            # critic-only warmup iterations
@@ -54,6 +55,10 @@ class Cfg:
   sharp_std: float = 0.12
   w_cross: float = 0.0        # crossing-instant sharp contact reward (targets timing near-misses)
   w_stop: float = 1.0
+  w_clear: float = 0.0        # reward ball deflection away from goal (+x / out of frame)
+  w_strike: float = 0.0       # reward forceful hand/foot velocity through ball toward +x
+  clear_min_vx: float = 0.5
+  strike_min_vx: float = 0.2
   w_posture: float = 0.0
   seed: int = 2810
   device: str = "cuda:0"
@@ -163,6 +168,10 @@ def main(cfg: Cfg):
     "cross": RewardTermCfg(func=_crossing_contact, weight=cfg.w_cross, params={"gate": 0.20, "std": 0.10}),
     "stop_ball": RewardTermCfg(func=goalkeeper_stop_ball, weight=cfg.w_stop,
                                params={"velocity_drop_threshold": 2.0, "goal_x": -0.5}),
+    "clear_ball": RewardTermCfg(func=goalkeeper_clear_ball, weight=cfg.w_clear,
+                                params={"min_clear_vx": cfg.clear_min_vx, "goal_x": -0.5}),
+    "strike_through": RewardTermCfg(func=goalkeeper_strike_through, weight=cfg.w_strike,
+                                    params={"min_limb_vx": cfg.strike_min_vx}),
     "posture": RewardTermCfg(func=goalkeeper_posture_orientation, weight=cfg.w_posture),
     "action_rate": RewardTermCfg(func=action_rate_l2_clip, weight=-0.1),
   }
@@ -200,10 +209,14 @@ def main(cfg: Cfg):
   with torch.no_grad():
     runner.alg.actor.distribution.std_param.fill_(cfg.std)
 
-  d = torch.load(cfg.bc_data, map_location="cpu", weights_only=False)
-  bk = d["blocked"].bool()
-  alg.bc_obs = d["obs"][bk].to(dev); alg.bc_act = d["act"][bk].to(dev)
-  print(f"[INFO] BC anchor {alg.bc_obs.shape[0]} pairs", flush=True)
+  if cfg.bc_coef > 0.0 and cfg.bc_data:
+    d = torch.load(cfg.bc_data, map_location="cpu", weights_only=False)
+    bk = d["blocked"].bool()
+    alg.bc_obs = d["obs"][bk].to(dev); alg.bc_act = d["act"][bk].to(dev)
+    print(f"[INFO] BC anchor {alg.bc_obs.shape[0]} pairs", flush=True)
+  else:
+    alg.bc_obs = None; alg.bc_act = None; alg.bc_coef = 0.0
+    print("[INFO] BC anchor disabled.", flush=True)
 
   ball = env.unwrapped.scene["ball"]
   policy = runner.get_inference_policy(device=dev)
